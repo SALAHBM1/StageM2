@@ -1,0 +1,208 @@
+---
+title: "MLASSO-transcriptomique"
+output: html_document
+date: "2026-06-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(caret)
+library(edgeR)
+library(limma)
+library(pROC)
+library(randomForest)
+```
+
+```{r}
+load("S23213.RData")
+cm_no40 = DATA$getGeneCount()
+cm_no40 = cm_no40[,-which(colnames(cm_no40) == "DTDS40")]
+cond_no40 = as.data.frame(t(read.table("~/cond_no40")))
+
+cm_no40 = cm_no40[,rownames(cond_no40)]
+
+  control = trainControl(method = "cv", number = 5, classProbs = T, summaryFunction = twoClassSummary, verbose = FALSE, savePredictions = "final")
+
+library(future)
+library(future.apply)
+nb_cores = parallel::detectCores() - 1
+plan(multisession, workers = nb_cores)
+
+X = cm_no40
+Y = as.factor(as.matrix(cond_no40$Pregnacy))
+Batch = as.factor(as.matrix(cond_no40$Mois))
+
+dge_global = DGEList(counts = X, group = Y)
+
+keep_arn = filterByExpr(dge_global)
+dge_filtre = dge_global[keep_arn, , keep.lib.size = F]
+clean_X = dge_filtre$counts
+
+vld = read.table("Ech_valid")$Ech
+vld_index = which(colnames(X) %in% vld)
+
+IdX = clean_X[,-vld_index]
+IdY = Y[-vld_index]
+IdBatch = Batch[-vld_index]
+bmatrix = model.matrix( ~ 0 + IdY)
+voom_ID = voom(IdX, bmatrix, plot = F)
+expr_ID = voom_ID$E
+
+validationX = clean_X[,vld_index]
+validationY = Y[vld_index]
+validBatch = Batch[vld_index]
+bvmatrix = model.matrix( ~ 0 + validationY)
+voom_valid = voom(validationX, bvmatrix, plot = F)
+expr_valid = voom_valid$E
+
+#Correction des batcheffects
+design_batch_train = model.matrix(~0 + IdBatch)
+fit_batch = lmFit(expr_ID, design_batch_train)
+
+batcheffects = fit_batch$coefficients
+colnames(batcheffects) = levels(as.factor(IdBatch))
+
+#Jeu d'identification
+expr_corr_Id = expr_ID
+for (i in 1:ncol(expr_ID)){
+  b = IdBatch[i]
+  expr_corr_Id[,i] = expr_ID[,i] - batcheffects[,b]
+}
+
+#Jeu de validation
+expr_corr_valid = expr_valid
+for (i in 1:ncol(expr_valid)){
+  b = validBatch[i]
+  expr_corr_valid[,i] = expr_valid[,i] - batcheffects[,b]
+}
+
+true_IdX = expr_corr_Id
+true_validX = expr_corr_valid
+
+run_iteration = function(i){
+
+  grid.lasso = expand.grid(alpha = 1, lambda = seq(0.001,0.1,length = 50))
+  #Separation Train - Test avant même sélection de variable
+  
+  G_index = which(IdY == "Gestantes")
+  NG_index = which(IdY == "Non_gestantes")
+  
+  train_G = sample(G_index, size = floor(0.7 * length(G_index)))
+  train_NG = sample(NG_index, size = floor(0.7 * length(NG_index)))
+  
+  train_index = c(train_G, train_NG)
+
+  train_X = as.data.frame(true_IdX[,train_index])
+  test_X = as.data.frame(true_IdX[,-train_index])
+  
+  train_Y = IdY[train_index]
+  test_Y = IdY[-train_index]
+  
+  genes_ad = apply(train_X, 1, sd)
+  top_1000_indices = order(genes_ad, decreasing = T)[1:1000]
+  matrice = train_X[top_1000_indices,]
+  
+  train_X = as.data.frame(t(matrice))
+
+  train_X$Statut = IdY[train_index]
+  
+#Lasso
+modele_lasso = train(Statut ~., data = train_X, method = "glmnet", metric = "ROC", trControl = control, tuneGrid = grid.lasso)
+  
+  imp = varImp(modele_lasso)$importance
+  good = which(imp$Overall > 0)
+  arn_imp = rownames(imp)[good]
+  return(arn_imp)
+
+}
+
+set.seed(1312)
+results = future_lapply(1:50, run_iteration, future.seed = T)
+
+ARNS = unlist(results)
+
+freq = data.frame(table(ARNS))
+
+a = freq[which(freq$Freq > 25),]
+good_arn = as.character(a$ARNS)
+
+h = hist(freq$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "")
+h = hist(freq$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "", ylim = c(0,max(h$counts)+10))
+abline(v= 30, col = "red")
+abline(v = 25, col= "blue")
+
+etiquettes = ifelse(h$counts>0, h$counts, "")
+text(x = h$mids,y=h$counts,labels = etiquettes, pos = 3, font = 2, col = "black", cex = 0.8)
+legend("topright", legend = c("Seuil à 52% (blue)", "Seuil à 60% (red)"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+```
+
+```{r}
+library(pROC)
+
+IdXf = as.data.frame(t(true_IdX[good_arn,]))
+colnames(IdXf) = good_arn
+validXf = as.data.frame(t(true_validX[good_arn,]))
+colnames(validXf) = good_arn
+
+grid.rf = expand.grid(mtry = 2)
+
+  control = trainControl(method = "cv", number = 5, classProbs = T, summaryFunction = twoClassSummary, verbose = FALSE, savePredictions = "final")
+
+set.seed(1312)
+modele_rf = train(x = IdXf,y = IdY, method = "rf", metric = "ROC", trControl = control, tuneGrid = grid.rf)
+
+predclass = predict(modele_rf, newdata = validXf)
+predprob = predict(modele_rf, newdata = validXf, type = "prob")
+
+res = confusionMatrix(predclass, validationY)
+print(res)
+
+probG = predprob[,"Gestantes"]
+
+objectroc = roc(response = as.factor(validationY), predictor = probG, levels = c("Non_gestantes","Gestantes"))
+coords_ideal = coords(objectroc, x= "all", ret = c("threshold", "specificity", "sensitivity"))
+seuil =  subset(coords_ideal, specificity == 1 )
+
+seuil = seuil$threshold[which.max(seuil$sensitivity)]
+
+ajusted = ifelse(probG > seuil, "Gestantes","Non_gestantes")
+
+res = confusionMatrix(as.factor(ajusted), validationY)
+print(res)
+
+plot(objectroc)
+auc(objectroc)
+
+which(predclass == "Gestantes" & validationY == "Non_gestantes")
+
+dis = colnames(validationX[,c(11,15)])
+
+table(cond_no40[dis,"Elevage"])
+table(cond_no40[colnames(validationX),"Elevage"])
+```
+
+```{r}
+
+seuild = 0.8
+
+plot(objectroc)
+abline(h = min(coords_ideal$sensitivity[which(coords_ideal$threshold < seuild)]), col = "firebrick", lty = 1)
+
+abline(v = max(coords_ideal$specificity[which(coords_ideal$threshold < seuild)]), col = "blue", lty = 1)
+
+threshsens = coords_ideal[,c("threshold","sensitivity")]
+threshspe = coords_ideal[,c("threshold","specificity")]
+plot(threshsens, type = "l", col = "blue",ylab = "Sensitivity & Specificity")
+lines(threshspe, type = "l", col = "red")
+legend("right", legend = c("Sensitivity", "Specificity"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+
+
+
+ajusted = ifelse(probG > 0.25, "Gestantes","Non_gestantes")
+
+res = confusionMatrix(as.factor(ajusted), validationY)
+print(res)
+```

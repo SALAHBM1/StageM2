@@ -1,0 +1,224 @@
+---
+title: "proteo_c1"
+output: html_document
+date: "2026-07-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Chargement des bibliothèques nécessaires pour l'analyse protéomique
+library(openxlsx)      # Pour lire les fichiers Excel
+library(limpa)         # Pour l'analyse de données protéomiques
+library(dplyr)         # Pour la manipulation de données
+library(stringr)       # Pour la manipulation de chaînes de caractères
+library(ade4)          # Pour l'analyse multivariée
+library(adegraphics)   # Pour les graphiques multivariés
+library(mixOmics)      # Pour les méthodes d'analyse multivariée (PLS-DA, sPLS-DA)
+
+# Lecture des données de protéomique à partir du fichier DIANN
+y.peptide <- readDIANN("work/DIANN_1_9_PRATEG_serie11/DIANN_1_9_PRATEG_serie1/report.tsv")
+
+# Lecture du fichier Excel contenant les métadonnées des échantillons
+metadata_all = read.xlsx("Echantillons OMC pour PRATEG_LG.xlsx")
+
+# Conversion de la colonne DATE_TE en format date (origine Excel)
+metadata_all$DATE_TE = as.Date(metadata_all$DATE_TE, origin = "1899-12-30")
+
+# Récupération de tous les noms d'échantillons (colonnes des données de peptides)
+sample_all = colnames(y.peptide$E)
+
+# Extraction de la condition (groupe) de chaque échantillon en fonction du nom d'échantillon
+# G1/NG1 = groupe 1, G2/NG2 = groupe 2
+condition <- ifelse(grepl("_G1", sample_all), "G1",
+             ifelse(grepl("_NG1", sample_all), "NG1",
+             ifelse(grepl("_G2", sample_all), "G2",
+             ifelse(grepl("_NG2", sample_all), "NG2", "NA"))))
+
+# Filtrage : conservation seulement des échantillons avec une condition identifiée
+y.peptide$E = y.peptide$E[,condition != "NA"]
+
+# Vérification des doublons dans les ID d'échantillons
+length(unique(metadata_all$ID))
+duplicated(metadata_all$ID)
+
+# Création d'un dataframe pour stocker les métadonnées correctes
+true_metadata = data.frame()
+
+# Boucle pour associer les conditions aux métadonnées pour chaque échantillon
+for (i in sample_all){
+
+  # Extraction de la condition de l'échantillon
+  condition <- ifelse(grepl("_G1", i), "G1",
+             ifelse(grepl("_NG1", i), "NG1",
+             ifelse(grepl("_G2", i), "G2",
+             ifelse(grepl("_NG2", i), "NG2", "NA"))))
+  
+  # Extraction de l'ID d'échantillon (4 chiffres) à partir du nom
+  ID = str_extract(i, "(?<=_)\\d{4}(?=_(?:N?G|PE|VM))")
+  
+  # Vérification si cet ID existe en doublon dans les métadonnées
+  dupl = sum(ID == metadata_all$ID)
+  
+  # Gestion des doublons : sélection de la date appropriée selon le groupe
+  if (dupl > 1){
+    row = metadata_all[which(metadata_all$ID == ID),]
+    # Pour G2/NG2 : prendre la date la plus récente (max), sinon la plus ancienne (min)
+    if (condition == "G2" | condition == "NG2"){
+      trow = row[which.max(row$DATE_TE),]
+    }
+    else {
+      trow = row[which.min(row$DATE_TE),]
+    }
+    trow = cbind(trow,condition)
+    true_metadata = rbind(true_metadata, trow)
+    
+  }
+  else{
+    # Cas sans doublon : association directe de la condition aux métadonnées
+    trow = cbind(metadata_all[which(metadata_all$ID == ID),],condition)
+    true_metadata = rbind(true_metadata, trow)
+  }
+  
+}
+
+# Filtrage des peptides : suppression des peptides non-protéotypiques
+# (peptides qui pourraient correspondre à plusieurs protéines)
+y.peptide <- filterNonProteotypicPeptides(y.peptide)
+
+# Filtrage des peptides associés à plusieurs protéines (peptides composés)
+y.peptide <- filterCompoundProteins(y.peptide)
+
+# Calcul du pourcentage de valeurs manquantes
+mean(is.na(y.peptide$E))
+
+# Ajustement de la correction directe de phases (DPC) pour normaliser les données
+dpcfit <- dpc(y.peptide)
+
+# Agrégation des peptides en protéines (quantification au niveau protéine)
+y.protein <- dpcQuant(y.peptide, protein.id = "Protein.Group", dpc=dpcfit)
+
+# Création d'une variable catégorique binaire : G (G1 ou G2) vs NG (NG1 ou NG2)
+category = ifelse(true_metadata$condition == "G1" |true_metadata$condition == "G2", "G", "NG" )
+
+# --- ANALYSE EN COMPOSANTES PRINCIPALES (ACP) ---
+# Réalisation d'une ACP sur les données protéomiques (2 axes)
+M.pca <- dudi.pca(y.protein$E,scale=T,center=T,scannf=F,nf = 2)
+
+# Affichage de l'ACP avec les échantillons colorés par catégorie
+s.class(M.pca$co,fac=as.factor(category),col=2:6)
+s.label(M.pca$co,col=2:6)
+
+print(gf)
+
+# Identification et suppression de l'outlier sur le premier axe principal
+index = order(M.pca$co[,1], decreasing = T)[1]
+
+y.protein = y.protein[,-index]
+metadata = true_metadata[-index,]
+
+# Recalcul de la catégorie après suppression de l'outlier
+category = ifelse(metadata$condition == "G1" |metadata$condition == "G2", "G", "NG" )
+```
+
+```{r}
+# --- ANALYSE DIFFÉRENTIELLE DES PROTÉINES (LIMMA) ---
+
+# Création du facteur de groupe
+Group <- factor(category)
+
+# Création de la matrice de design sans intercept (une colonne par groupe)
+design <- model.matrix(~ 0 + Group)
+colnames(design) <- c("G", "NG")
+
+# Ajustement d'un modèle linéaire pour chaque protéine (équivalent à lmFit de limma)
+fit <- dpcDE(y.protein, design, plot=TRUE)
+
+# Définition de la matrice de contraste : comparaison G vs NG
+contrast_matrix <- makeContrasts(G - NG, levels = design)
+
+# Application du contraste au modèle
+fit2 <- contrasts.fit(fit, contrast_matrix)
+
+# Ajustement Bayésien des statistiques (améliore les estimations des variances)
+fit2 <- eBayes(fit2)
+```
+
+```{r}
+# --- VISUALISATION DES RÉSULTATS (VOLCANO PLOTS) ---
+library(EnhancedVolcano)
+
+# Résumé du nombre de protéines différentiellement exprimées (seuil : p-valeur < 0.05)
+summary(decideTests(fit2,adjust.method="BH",p.value=0.05))
+
+# Extraction de tous les résultats d'analyse différentielle
+df = topTable(fit2,number = Inf)
+
+# Volcano plot 1 : utilisant la p-valeur brute (non ajustée)
+EnhancedVolcano(df, lab = rownames(df), x='logFC', y = 'P.Value', pCutoff = 0.05, FCcutoff = 1)
+
+# Volcano plot 2 : utilisant la p-valeur ajustée (contrôle du FDR)
+EnhancedVolcano(df, lab = rownames(df), x='logFC', y = 'adj.P.Val', pCutoff = 0.05, FCcutoff = 1)
+```
+
+```{r}
+# --- ANALYSE PLS-DA (Partial Least Squares Discriminant Analysis) ---
+library(mixOmics)
+library(ropls)
+
+# Construction d'un modèle sPLS-DA avec 50 protéines pour la composante 1 et 30 pour la composante 2
+sp = mixOmics::splsda(t(y.protein$E),  category, keepX = c(50,30))
+
+# Affichage des scores du modèle sPLS-DA avec ellipses de confiance par groupe
+plotIndiv(sp, ellipse = T, legend = T)
+
+# Validation du modèle par cross-validation (5 folds, 10 répétitions)
+perfs = perf(sp, validation = "Mfold", folds = 5 , nreapeat = 10)
+
+# Affichage du taux d'erreur de classification (BER = Balanced Error Rate)
+perfs$error.rate$BER
+```
+
+```{r}
+# --- CLUSTERING HIÉRARCHIQUE ET DENDROGRAMME ---
+library(dendextend)
+
+# Sélection des 50 protéines les plus discriminantes selon le modèle sPLS-DA
+gene = selectVar(sp, n=50)
+
+# Extraction de la matrice de ces 50 protéines pour tous les échantillons
+gprotein = t(y.protein$E)[,gene$name]
+
+# Standardisation (scaling) des données pour que chaque protéine ait moyenne=0 et écart-type=1
+data = scale(gprotein)
+
+# Calcul de la matrice de distance euclidienne entre les échantillons
+protdist = dist(data)
+
+# Construction du dendrogramme par clustering hiérarchique (liaison complète par défaut)
+protclust = hclust(protdist)
+
+# Préparation des couleurs pour les catégories
+GNG = category
+cond = as.character(unique(GNG))
+couleurs = c("#E41A1C", "#377EB8")
+names(couleurs) = cond
+
+# Association d'une couleur à chaque échantillon selon sa catégorie
+col_ech = couleurs[as.character(GNG)]
+
+# Conversion du clustering en dendrogramme
+dend = as.dendrogram(protclust)
+
+# Ajustement des marges et affichage du dendrogramme
+par(mar = c(10,4,4,2))
+plot(dend, leaflab = "none", ylim = c(-1, max(protclust$height)))
+
+# Ajout de barres de couleur au-dessous du dendrogramme pour identifier les catégories
+colored_bars(colors = col_ech, dend = dend, rowLabels = "Catégories", y_shift = -0.2)
+
+# Ajout d'une légende
+legend("topright",legend = cond, fill = couleurs, title = "Catégories", cex = 0.8, bty = "n")
+```

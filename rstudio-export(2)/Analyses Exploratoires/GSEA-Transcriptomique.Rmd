@@ -1,0 +1,88 @@
+---
+title: "GSEA-Transcriptomique"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GSEA - Transcriptomique
+
+```{r}
+library(DESeq2)
+#Données RNAseq
+load("~/S23213.RData")
+raw_counts_no40 = DATA$getGeneCount()
+raw_counts_no40 = raw_counts_no40[,-which(colnames(raw_counts_no40) == "DTDS40")]
+raw_counts_no40 = raw_counts_no40[-(which(rowSums(raw_counts_no40) < 10)),] 
+
+cond_no40 = as.matrix(read.table("~/cond_no40")[2,])
+
+GNG = as.factor(cond_no40)
+dds = DESeqDataSetFromMatrix(raw_counts_no40, DataFrame(GNG), ~GNG) 
+dds = DESeq(dds)
+res = results(dds)
+```
+
+```{r}
+library("org.Bt.eg.db")
+library(dplyr)
+
+res_df = as.data.frame(res)
+
+res_df$ensemblid = rownames(res_df)
+
+res_df$SYMBOL = mapIds(org.Bt.eg.db, keys = res_df$ensemblid, column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+r_df = res_df %>%
+  filter(!is.na(SYMBOL)) %>%
+  mutate(rank_score = sign(log2FoldChange)* -log10(pvalue))%>%
+  arrange(desc(rank_score))
+
+r_list = r_df$rank_score
+names(r_list) = r_df$SYMBOL
+
+r_list = r_list[!duplicated(names(r_list))]
+
+library("clusterProfiler")
+library("msigdbr")
+
+bpth = msigdbr(species = "Bos taurus", category = "C5", subcategory = "GO:BP")
+
+pth_gmt = bpth %>% dplyr::select(gs_name, gene_symbol)
+
+
+gse_G_vs_NG <- GSEA(geneList = r_list, 
+             TERM2GENE = pth_gmt,
+             minGSSize = 10, 
+             maxGSSize = 500,
+             pvalueCutoff = 0.05,
+             verbose = FALSE,
+             pAdjustMethod = "BH")
+
+dotplot(gse_G_vs_NG, showCategory=10, 
+        title = "Enriched GO terms")
+
+gsea_df = as.data.frame(gse_G_vs_NG)
+
+top = gsea_df %>% slice_min(order_by = p.adjust, n=7)
+
+dotplot(gse_G_vs_NG, showCategory=nrow(top), split = ".sign")
+```
+
+```{r}
+gse_G_vs_NG <- gseGO(geneList = r_list, 
+             ont ="BP", 
+             keyType = "SYMBOL", 
+             minGSSize = 10, 
+             maxGSSize = 500,
+             pvalueCutoff = 0.1, #0.05
+             verbose = FALSE,
+             OrgDb = org.Bt.eg.db, 
+             pAdjustMethod = "BH")
+
+dotplot(gse_G_vs_NG, showCategory=5, 
+        split=".sign", title = "Enriched GO terms")
+```

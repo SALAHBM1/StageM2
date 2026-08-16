@@ -1,0 +1,401 @@
+---
+title: "Stratification_cohorte2"
+output: html_document
+date: "2026-07-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(openxlsx)
+library(limpa)
+library(dplyr)
+library(stringr)
+library(ade4)
+library(adegraphics)
+library(mixOmics)
+library(caret)
+library("randomForest")
+library(pROC)
+
+y.peptide <- readDIANN("~/work/DIANN_1_9_PRATEG_serie2/report.tsv")
+
+metadata_all = read.xlsx("~/work/Cohorte 2_Synthèse TE PRATEG - Corrigé.xlsx",sheet=2)[1:206,]
+
+
+metadata_all$ID.receveuse[metadata_all$ID.receveuse=="FR5502758014"] = "FR5502750001"
+metadata_all$ID.receveuse[metadata_all$ID.receveuse=="FR4321815388"] = "FR4321810002"
+metadata_all$ID.receveuse[metadata_all$ID.receveuse=="FR5502730548"] = "FR5502730003"
+
+metadata_all$code_num = substr(metadata_all$ID.receveuse, nchar(metadata_all$ID.receveuse) - 3, nchar(metadata_all$ID.receveuse))
+
+colnames(y.peptide$E)[colnames(y.peptide$E)=="5-31-2025_93_8014_G_12536"]="5-31-2025_93_0001_G_12536"
+colnames(y.peptide$E)[colnames(y.peptide$E)=="4-26-2025_134_5388_NG_12062"]="4-26-2025_134_0002_NG_12062"
+colnames(y.peptide$E)[colnames(y.peptide$E)=="6-2-2025_175_0548_NG_12600"]="6-2-2025_175_0003_NG_12600"
+colnames(y.peptide$E)[colnames(y.peptide$E)=="5-30-2025_113_08437_PE_12511"]="5-30-2025_113_8437_PE_12511"
+
+sample_all = colnames(y.peptide$E)
+
+sample = as.data.frame(colnames(y.peptide$E))
+colnames(sample) = "sample_ID"
+
+sample_mat = data.frame()
+
+for (i in sample$sample_ID){
+  code_num = (str_split(i, "_")[[1]])[3]
+  sample_mat = rbind(sample_mat, c(i,code_num))
+  
+}
+
+names(sample_mat) = c("sample_ID", "code_num")
+
+metadata = merge(sample_mat,metadata_all,by = "code_num",sort = FALSE)
+metadata$Date.du.TE = as.Date(metadata$Date.du.TE, origin = "1899-12-30")
+metadata$Date.du.TE = format(metadata$Date.du.TE, "%m-%d-%Y")
+
+metadata$code_num = substr(metadata$ID.receveuse, nchar(metadata$ID.receveuse)-3,nchar(metadata$ID.receveuse))
+
+tmetadata = metadata
+
+metadata$Catégories = ifelse(metadata$Catégories == "NR", "NG", "G")
+
+
+y.lupine <- read.delim("~/lupine_quant_c2", row.names=1)
+
+colnames(y.lupine) = sub("^X", "", colnames(y.lupine))
+colnames(y.lupine) = gsub("\\.", "-", colnames(y.lupine))
+
+
+y.lupine = y.lupine[!grepl("conta\\|", rownames(y.lupine)),]
+y.lupine = y.lupine[,metadata$sample_ID]
+
+M.pca <- dudi.pca(y.lupine,scale=T,center=T,scannf=F,nf=4)
+
+s.class(M.pca$co,fac=as.factor(metadata$Catégories),col=2:6)
+
+
+```
+
+Vitro seulement
+
+```{r}
+metadatavitro = metadata[which(metadata$Nature.embryon == "VITRO"),]
+y.vitro = y.lupine[,metadatavitro$sample_ID]
+y.vitro = y.vitro[,metadatavitro$sample_ID]
+
+M.pca <- dudi.pca(y.vitro,scale=T,center=T,scannf=F,nf=4)
+s.class(M.pca$co,fac=as.factor(metadatavitro$Catégories),col=2:6)
+
+set.seed(1312)
+vitrovalidindex = createDataPartition(y = metadatavitro$Catégories, p = 0.3, list = F)
+data_valid_vitro = y.vitro[,vitrovalidindex]
+metadata_valid_vitro = metadatavitro[vitrovalidindex,]
+
+data_ID_vitro = y.vitro[,-vitrovalidindex]
+metadata_ID_vitro = metadatavitro[-vitrovalidindex,]
+
+```
+
+```{r}
+control = trainControl(method = "cv", number = 5, classProbs = T, summaryFunction = twoClassSummary, verbose = FALSE, savePredictions = "final")
+
+grid.lasso = expand.grid(alpha = 1, lambda = seq(0.001,0.1,length = 50))
+proteines = NULL
+
+X = t(data_ID_vitro)
+Y = as.factor(metadata_ID_vitro$Catégories)
+
+GvitroID = which(metadata_ID_vitro$Catégories == "G")
+NGvitroID = which(metadata_ID_vitro$Catégories == "NG")
+
+runiter = function(i){
+
+  train_index = createDataPartition(y = Y, p = 0.70, list = F)
+  
+  train_X = data.frame(X[train_index,])
+  test_X = X[-train_index,]
+  
+  train_Y = Y[train_index]
+  test_Y = Y[-train_index]
+  
+  train_X$Statut = train_Y
+  
+  modele_lasso = train(Statut ~., data = train_X, method = "glmnet", metric = "ROC", trControl = control, tuneGrid = grid.lasso, preProcess = c("center","scale","nzv"))
+  
+  coef = coef(modele_lasso$finalModel, modele_lasso$bestTune$lambda)
+  prot= rownames(coef)[which(coef[,1] != 0)]
+  prot = prot[prot != "(Intercept)"]
+  return(prot)
+}
+
+library(future)
+library(future.apply)
+nb_cores = parallel::detectCores() - 1
+plan(multisession, workers = nb_cores)
+
+set.seed(1312)
+results = future_lapply(1:50, runiter, future.seed = T)
+
+proteines = unlist(results)
+
+a = data.frame(table(proteines))
+good_prot = rownames(data.frame(which(table(proteines) >= 30)))
+good_prot
+
+h = hist(a$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "")
+h = hist(a$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "", ylim = c(0,max(h$counts)+10))
+abline(v= 30, col = "red")
+abline(v = 25, col= "blue")
+
+etiquettes = ifelse(h$counts>0, h$counts, "")
+text(x = h$mids,y=h$counts,labels = etiquettes, pos = 3, font = 2, col = "black", cex = 0.8)
+legend("topright", legend = c("Seuil à 52% (blue)", "Seuil à 60% (red)"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+```
+
+```{r}
+control = trainControl(method = "cv", number = 5, classProbs = T, summaryFunction = twoClassSummary, verbose = FALSE, savePredictions = "final")
+
+data_IDtrain = as.data.frame(t(data_ID_vitro[good_prot,]))
+data_validfinal = as.data.frame(t(data_valid_vitro[good_prot,]))
+grid.rf = expand.grid(mtry = 2)
+
+#protc1 = read.table("protc1")$x
+
+#data_IDtrain = as.data.frame(t(data_ID_vitro[protc1,]))
+#data_validfinal = as.data.frame(t(data_valid_vitro[protc1,]))
+#grid.rf = expand.grid(mtry = c(3,4))
+
+set.seed(1312)
+modele_rf = train(x = data_IDtrain,y = metadata_ID_vitro$Catégories, method = "rf", metric = "ROC", trControl = control, tuneGrid = grid.rf, ntree = 1000)
+```
+
+```{r}
+predclass = predict(modele_rf, newdata = data_validfinal)
+predprob = predict(modele_rf, newdata = data_validfinal, type = "prob")
+
+res = confusionMatrix(predclass, as.factor(metadata_valid_vitro$Catégories))
+print(res)
+
+probG = predprob[,"G"]
+
+objectroc = roc(response = as.factor(metadata_valid_vitro$Catégories), predictor = probG, levels = c("NG", "G"))
+coords_ideal = coords(objectroc, x= "all", ret = c("threshold", "specificity", "sensitivity"))
+seuil = coords_ideal[coords_ideal$specificity == 1,]
+seuil = min(seuil$threshold)
+
+seuil
+
+ajusted = ifelse(probG > seuil, "G","NG")
+res2 = confusionMatrix(as.factor(ajusted), as.factor(metadata_valid_vitro$Catégories))
+print(res2)
+
+threshsens = coords_ideal[,c("threshold","sensitivity")]
+threshspe = coords_ideal[,c("threshold","specificity")]
+plot(threshsens, type = "l", col = "blue",ylab = "Sensitivity & Specificity")
+lines(threshspe, type = "l", col = "red")
+legend("right", legend = c("Sensitivity", "Specificity"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+
+
+
+plot(objectroc)
+
+
+rownames(tmetadata) = tmetadata$sample_ID
+
+recap = data.frame("Echantillon" = rownames(data_validfinal), "Classe" = tmetadata[rownames(data_validfinal),"Catégories"], "Probabilité" = probG)
+
+library(tidyverse)
+thresholds = seq(0,1, by =0.01)
+
+df_evo = map_dfr(thresholds, function(t){
+  recap %>%
+    group_by(Classe)%>%
+    summarise(
+      prop_gestante = sum(Probabilité >= t),
+              nb_total = n(),
+              .groups = "drop"
+    )%>%
+    mutate(seuil = t)
+})
+
+ggplot(df_evo, aes(x = seuil, y = prop_gestante, color = Classe))+
+  geom_line(size = 1.2)
+```
+
+In vivo
+
+```{r}
+metadatavivo = metadata[which(metadata$Nature.embryon == "VIVO"),]
+y.vivo = y.lupine[,metadatavivo$sample_ID]
+y.vivo = y.vivo[,metadatavivo$sample_ID]
+
+M.pca <- dudi.pca(y.vivo,scale=T,center=T,scannf=F,nf=4)
+s.class(M.pca$co,fac=as.factor(metadatavivo$Catégories),col=2:6)
+
+
+Gvivo = which(metadatavivo$Catégories == "G")
+NGvivo = which(metadatavivo$Catégories == "NG")
+
+set.seed(1312)
+vivovalidindex =  createDataPartition(y = metadatavivo$Catégories, p = 0.3, list = F)
+data_valid_vivo = y.vivo[,vivovalidindex]
+metadata_valid_vivo = metadatavivo[vivovalidindex,]
+
+data_ID_vivo = y.vivo[,-vivovalidindex]
+metadata_ID_vivo = metadatavivo[-vivovalidindex,]
+```
+
+```{r}
+control = trainControl(method = "repeatedcv", number = 5,repeats = 3, classProbs = T, summaryFunction = twoClassSummary, verbose = FALSE)
+
+proteines = NULL
+
+X = t(data_ID_vivo)
+Y = as.factor(metadata_ID_vivo$Catégories)
+
+GvivoID = which(metadata_ID_vivo$Catégories == "G")
+NGvivoID = which(metadata_ID_vivo$Catégories == "NG")
+
+set.seed(1312)
+results = future_lapply(1:50, runiter, future.seed = T)
+
+proteines = unlist(results)
+
+a = data.frame(table(proteines))
+good_protvivo = rownames(data.frame(which(table(proteines) > 25 )))
+good_protvivo
+
+h = hist(a$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "")
+h = hist(a$Freq, breaks = 50, xlab = "Fréquence de sélection", ylab = "Nombre d'ARNs", main = "", ylim = c(0,max(h$counts)+10))
+abline(v= 30, col = "red")
+abline(v = 25, col= "blue")
+
+etiquettes = ifelse(h$counts>0, h$counts, "")
+text(x = h$mids,y=h$counts,labels = etiquettes, pos = 3, font = 2, col = "black", cex = 0.8)
+legend("topright", legend = c("Seuil à 52% (blue)", "Seuil à 60% (red)"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+```
+
+```{r}
+data_IDtrain = as.data.frame(t(data_ID_vivo[good_protvivo,]))
+data_validfinal = as.data.frame(t(data_valid_vivo[good_protvivo,]))
+
+#data_IDtrain = as.data.frame(t(data_ID_vivo[protc1,]))
+#data_validfinal = as.data.frame(t(data_valid_vivo[protc1,]))
+
+
+set.seed(1312)
+modele_rf = train(x = data_IDtrain,y = metadata_ID_vivo$Catégories, method = "rf", metric = "ROC", trControl = control, tuneGrid = grid.rf, ntree = 1000)
+```
+
+```{r}
+predclass = predict(modele_rf, newdata = data_validfinal)
+predprob = predict(modele_rf, newdata = data_validfinal, type = "prob")
+
+res = confusionMatrix(predclass, as.factor(metadata_valid_vivo$Catégories))
+print(res)
+
+probG = predprob[,"G"]
+
+
+objectroc = roc(response = as.factor(metadata_valid_vivo$Catégories), predictor = probG, levels = c("NG", "G"))
+coords_ideal = coords(objectroc, x= "all", ret = c("threshold", "specificity", "sensitivity"))
+seuil = coords_ideal[coords_ideal$specificity == 1,]
+seuil = min(seuil$threshold)
+
+seuil
+
+ajusted = ifelse(probG > seuil
+                 , "G","NG")
+res2 = confusionMatrix(as.factor(ajusted), as.factor(metadata_valid_vivo$Catégories))
+print(res2)
+
+plot(objectroc)
+
+threshsens = coords_ideal[,c("threshold","sensitivity")]
+threshspe = coords_ideal[,c("threshold","specificity")]
+plot(threshsens, type = "l", col = "blue",ylab = "Sensitivity & Specificity")
+lines(threshspe, type = "l", col = "red")
+legend("right", legend = c("Sensitivity", "Specificity"), col = c("blue","red"), lty = 1, lwd = 2, bty = "o")
+
+
+rownames(tmetadata) = tmetadata$sample_ID
+
+recap = data.frame("Echantillon" = rownames(data_validfinal), "Classe" = tmetadata[rownames(data_validfinal),"Catégories"], "Probabilité" = probG)
+
+library(tidyverse)
+thresholds = seq(0,1, by =0.01)
+
+df_evo = map_dfr(thresholds, function(t){
+  recap %>%
+    group_by(Classe)%>%
+    summarise(
+      prop_gestante = sum(Probabilité >= t),
+              nb_total = n(),
+              .groups = "drop"
+    )%>%
+    mutate(seuil = t)
+})
+
+ggplot(df_evo, aes(x = seuil, y = prop_gestante, color = Classe))+
+  geom_line(size = 1.2)
+```
+
+```{r}
+good_protvivo_com = c("A0A6B9SDV0","A0A6B9SE14","A0A6B9SF08","E1BB79","P09487","P26201")
+signature = c(good_prot,good_protvivo_com)
+signature
+
+datatrainvitro = as.data.frame(t(data_ID_vitro[signature,]))
+datatrainvitro$Embryo = 0
+
+datatrainvivo = as.data.frame(t(data_ID_vivo[signature,]))
+datatrainvivo$Embryo = 1
+
+colnames(datatrainvitro) == colnames(datatrainvivo)
+datatrainfinal = as.data.frame(rbind(datatrainvitro,datatrainvivo))
+datatrainfinal$Embryo = as.factor(datatrainfinal$Embryo)
+
+metadatatrainfinal = rbind(metadata_ID_vitro,metadata_ID_vivo)
+
+datavalidvitro = as.data.frame(t(data_valid_vitro[signature,]))
+datavalidvitro$Embryo = 0
+datavalidvivo = as.data.frame(t(data_valid_vivo[signature,]))
+datavalidvivo$Embryo = 1
+
+metadatavalidfinal = rbind(metadata_valid_vitro,metadata_valid_vivo)
+
+colnames(datavalidvitro) == colnames(datavalidvivo)
+datavalidfinal = as.data.frame(rbind(datavalidvitro,datavalidvivo))
+datavalidfinal$Embryo = as.factor(datavalidfinal$Embryo)
+
+grid.rf = expand.grid(mtry = 3)
+
+set.seed(1312)
+modele_rf = train(x = datatrainfinal,y = metadatatrainfinal$Catégories, method = "rf", metric = "ROC", trControl = control, tuneGrid = grid.rf, ntree=2000)
+
+predclass = predict(modele_rf, newdata = datavalidfinal)
+predprob = predict(modele_rf, newdata = datavalidfinal, type = "prob")
+
+res = confusionMatrix(predclass, as.factor(metadatavalidfinal$Catégories))
+print(res)
+
+probG = predprob[,"G"]
+
+objectroc = roc(response = as.factor(metadatavalidfinal$Catégories), predictor = probG, levels = c("G", "NG"))
+coords_ideal = coords(objectroc, x= "all", ret = c("threshold", "specificity", "sensitivity"))
+seuil = coords_ideal[coords_ideal$specificity == 1,]
+seuil = min(seuil$threshold)
+
+seuil
+
+ajusted = ifelse(probG > seuil
+                 , "G","NG")
+res2 = confusionMatrix(as.factor(ajusted), as.factor(metadatavalidfinal$Catégories))
+print(res2)
+
+verif = data.frame(Statut_reel = metadatavalidfinal$Catégories, Prediction = ajusted, Type_embryon = metadatavalidfinal$Nature.embryon)
+
+
+```

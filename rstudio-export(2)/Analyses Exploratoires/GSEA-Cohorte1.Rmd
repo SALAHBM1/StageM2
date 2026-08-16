@@ -1,0 +1,156 @@
+---
+title: "GSEA-Cohorte1"
+output: html_document
+date: "2026-05-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(openxlsx)
+library(limpa)
+library(dplyr)
+library(stringr)
+library(ade4)
+library(adegraphics)
+library(mixOmics)
+```
+
+```{r}
+y.peptide <- readDIANN("work/DIANN_1_9_PRATEG_serie11/DIANN_1_9_PRATEG_serie1/report.tsv")
+
+metadata_all = read.xlsx("Echantillons OMC pour PRATEG_LG.xlsx")
+
+metadata_all$DATE_TE = as.Date(metadata_all$DATE_TE, origin = "1899-12-30")
+
+sample_all = colnames(y.peptide$E)
+
+condition <- ifelse(grepl("_G1", sample_all), "G1",
+             ifelse(grepl("_NG1", sample_all), "NG1",
+             ifelse(grepl("_G2", sample_all), "G2",
+             ifelse(grepl("_NG2", sample_all), "NG2", "NA"))))
+
+y.peptide$E = y.peptide$E[,condition != "NA"]
+
+length(unique(metadata_all$ID))
+duplicated(metadata_all$ID)
+
+true_metadata = data.frame()
+for (i in sample_all){
+
+  condition <- ifelse(grepl("_G1", i), "G1",
+             ifelse(grepl("_NG1", i), "NG1",
+             ifelse(grepl("_G2", i), "G2",
+             ifelse(grepl("_NG2", i), "NG2", "NA"))))
+  
+  ID = str_extract(i, "(?<=_)\\d{4}(?=_(?:N?G|PE|VM))")
+  
+  dupl = sum(ID == metadata_all$ID)
+  
+  if (dupl > 1){
+    row = metadata_all[which(metadata_all$ID == ID),]
+    if (condition == "G2" | condition == "NG2"){
+      trow = row[which.max(row$DATE_TE),]
+    }
+    else {
+      trow = row[which.min(row$DATE_TE),]
+    }
+    trow = cbind(trow,condition)
+    true_metadata = rbind(true_metadata, trow)
+    
+  }
+  else{
+    trow = cbind(metadata_all[which(metadata_all$ID == ID),],condition)
+    true_metadata = rbind(true_metadata, trow)
+  }
+  
+}
+
+y.peptide <- filterNonProteotypicPeptides(y.peptide)
+y.peptide <- filterCompoundProteins(y.peptide)
+
+mean(is.na(y.peptide$E))
+
+dpcfit <- dpc(y.peptide)
+y.protein <- dpcQuant(y.peptide, protein.id = "Protein.Group", dpc=dpcfit)
+
+```
+
+```{r}
+library("clusterProfiler")
+library("org.Bt.eg.db")
+
+true_metadata$condition = ifelse(true_metadata$condition == "G1" |true_metadata$condition == "G2", "G", "NG" )
+table(true_metadata$condition)
+
+Group <- factor(true_metadata$condition)
+design <- model.matrix(~ 0 + Group)
+dim(design)
+colnames(design) <- c("G", "NG")
+fit <- dpcDE(y.protein, design, plot=TRUE) # équivalent du lmFit limma
+
+contrast_matrix <- makeContrasts(G - NG, levels = design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+hist(fit2$p.value,100)
+
+summary(decideTests(fit2,adjust.method="BH",p.value=0.05))
+
+res = topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
+res_index = order(res$P.Value,decreasing = T)
+res = as.data.frame(res[res_index,])
+
+df = res %>% 
+  mutate(rank_score = sign(logFC) * -log10(P.Value)) %>% arrange(desc(rank_score))
+
+
+
+ids = bitr(rownames(res), fromType = "UNIPROT", toType = "SYMBOL", OrgDb = org.Bt.eg.db)
+df = df[ids$UNIPROT,]
+df = cbind(df, ids$SYMBOL)
+
+df_unique = df %>% group_by(`ids$SYMBOL`) %>% slice_max(order_by = abs(rank_score), n=1, with_ties = FALSE) %>% ungroup()
+df_unique = df_unique[!is.na(df_unique$rank_score),]
+df_unique = df_unique[!is.infinite(df_unique$rank_score),]
+df_unique = df_unique[df_unique$`ids$SYMBOL` != "" & !is.na(df_unique$`ids$SYMBOL`),]
+
+df_unique = df_unique[order(df_unique$rank_score, decreasing = T),]
+
+gene_list = df_unique$rank_score
+names(gene_list) = df_unique$`ids$SYMBOL`
+
+library("msigdbr")
+bpth = msigdbr(species = "Bos taurus", category = "C2", subcategory = "CP")
+pth_gmt = bpth %>% dplyr::select(gs_name, gene_symbol)
+
+gse_G_vs_NG <- GSEA(geneList =gene_list, 
+             TERM2GENE = pth_gmt,
+             minGSSize = 3, 
+             maxGSSize = 500,
+             pvalueCutoff =  1,
+             verbose = FALSE,
+             pAdjustMethod = "BH")
+
+
+dotplot(gse_G_vs_NG, showCategory=nrow(gse_G_vs_NG), 
+        title = "Enriched MsigDB terms")
+```
+
+```{r}
+gse_G_vs_NG <- gseGO(geneList = gene_list, 
+             ont ="BP", 
+             keyType = "SYMBOL", 
+             minGSSize = 3, 
+             maxGSSize = 100,
+             pvalueCutoff = 0.05,
+             verbose = FALSE,
+             OrgDb = org.Bt.eg.db, 
+             pAdjustMethod = "BH")
+
+dotplot(gse_G_vs_NG, showCategory=5, 
+        split=".sign", title = "Enriched GO terms")
+```
+
